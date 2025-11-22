@@ -27,6 +27,20 @@ class I2SAudioSpeaker : public I2SAudioOut, public speaker::Speaker, public Comp
   void dump_config() override;
   void loop() override;
 
+  /// @brief Sets the ring buffer duration for audio playback
+  /// @param buffer_duration_ms Duration in milliseconds (default: 500ms)
+  ///
+  /// The ring buffer temporarily stores audio data before it's sent to the I2S hardware.
+  /// A minimum internal duration (120ms for 4 DMA buffers @ 15ms each) is enforced to
+  /// prevent underruns. The effective buffer size will be max(buffer_duration_ms, minimum_internal).
+  ///
+  /// Larger values provide more tolerance for network delays and CPU scheduling issues,
+  /// but increase latency. Smaller values reduce latency but may cause audio glitches.
+  ///
+  /// Recommended values:
+  /// - Local playback: 200-500ms
+  /// - Network streaming: 500-1000ms
+  /// - M5 Atom Echo: 500ms (default, tested stable)
   void set_buffer_duration(uint32_t buffer_duration_ms) { this->buffer_duration_ms_ = buffer_duration_ms; }
   void set_timeout(uint32_t ms) { this->timeout_ = ms; }
 #ifdef USE_I2S_LEGACY

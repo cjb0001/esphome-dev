@@ -6,6 +6,7 @@
 #include "esphome/core/hal.h"
 #include "esphome/core/helpers.h"
 #include "esphome/core/log.h"
+#include "esp_task_wdt.h"
 
 #include "esphome/components/audio/audio_transfer_buffer.h"
 
@@ -13,18 +14,30 @@
 #include "esphome/components/ota/ota_backend.h"
 #endif
 
+#include <algorithm>
+
 namespace esphome {
 namespace micro_wake_word {
 
 static const char *const TAG = "micro_wake_word";
 
+// Early warning threshold before buffer exhaustion causes audio loss
+static constexpr size_t MIC_RING_BUFFER_LOW_FREE_THRESHOLD = 1024;
+
+// Periodic logging intervals to monitor component health without flooding logs
+static constexpr uint32_t INFERENCE_PROGRESS_LOG_INTERVAL_MS = 5000;  // Log every 5 seconds at VERBOSE level
+static constexpr uint32_t DSP_PROGRESS_LOG_INTERVAL_MS = 10000;       // Log every 10 seconds at VERBOSE level
+
+// FreeRTOS queue depth for wake word detection events (rare occurrences, small queue sufficient)
 static const ssize_t DETECTION_QUEUE_LENGTH = 5;
 
+// Maximum wait time for audio data transfer; matches ~20Hz update rate for responsive audio processing
 static const size_t DATA_TIMEOUT_MS = 50;
 
-static const uint32_t RING_BUFFER_DURATION_MS = 120;
-
+// FreeRTOS task stack size: 3KB is standard for ESP32 TensorFlow Lite Micro inference tasks
 static const uint32_t INFERENCE_TASK_STACK_SIZE = 3072;
+
+// FreeRTOS task priority: 3 is medium priority (higher than idle, lower than critical system tasks)
 static const UBaseType_t INFERENCE_TASK_PRIORITY = 3;
 
 enum EventGroupBits : uint32_t {
@@ -63,6 +76,7 @@ static const LogString *micro_wake_word_state_to_string(State state) {
 
 void MicroWakeWord::dump_config() {
   ESP_LOGCONFIG(TAG, "microWakeWord:");
+  ESP_LOGCONFIG(TAG, "  Ring buffer duration: %" PRIu32 " ms", this->ring_buffer_duration_ms_);
   ESP_LOGCONFIG(TAG, "  models:");
   for (auto &model : this->wake_word_models_) {
     model->log_model_config();
@@ -107,15 +121,57 @@ void MicroWakeWord::setup() {
     if (this->state_ == State::STOPPED) {
       return;
     }
+    const auto use_count = this->ring_buffer_.use_count();
+    if (use_count == 0) {
+      ESP_LOGW(TAG,
+               "Microphone produced %u bytes but inference task not ready "
+               "(use_count=%zu state=%s)",
+               static_cast<unsigned>(data.size()), use_count,
+               LOG_STR_ARG(micro_wake_word_state_to_string(this->state_)));
+      return;
+    }
     std::shared_ptr<RingBuffer> temp_ring_buffer = this->ring_buffer_.lock();
-    if (this->ring_buffer_.use_count() > 1) {
-      size_t bytes_free = temp_ring_buffer->free();
+    if (temp_ring_buffer == nullptr) {
+      ESP_LOGW(TAG, "Microphone ring buffer expired before write");
+      return;
+    }
+    size_t bytes_free = temp_ring_buffer->free();
 
-      if (bytes_free < data.size()) {
-        xEventGroupSetBits(this->event_group_, EventGroupBits::WARNING_FULL_RING_BUFFER);
-        temp_ring_buffer->reset();
+    if (bytes_free < data.size()) {
+      ESP_LOGW(TAG,
+               "Microphone ring buffer overflow (free=%zu incoming=%u), "
+               "pausing microphone to relieve backpressure",
+               bytes_free, static_cast<unsigned>(data.size()));
+      xEventGroupSetBits(this->event_group_, EventGroupBits::WARNING_FULL_RING_BUFFER);
+      this->ring_buffer_low_free_logged_ = true;
+      if (this->microphone_source_->is_passive()) {
+        ESP_LOGW(TAG, "Microphone source is passive; cannot pause capture. "
+                      "Dropping audio frame");
+        return;
       }
-      temp_ring_buffer->write((void *) data.data(), data.size());
+      this->pause_microphone_for_backpressure_("ring buffer overflow");
+      return;
+    } else if (bytes_free < MIC_RING_BUFFER_LOW_FREE_THRESHOLD) {
+      if (!this->ring_buffer_low_free_logged_) {
+        ESP_LOGD(TAG, "Microphone ring buffer low free bytes (free=%zu threshold=%u)", bytes_free,
+                 static_cast<unsigned>(MIC_RING_BUFFER_LOW_FREE_THRESHOLD));
+        this->ring_buffer_low_free_logged_ = true;
+      }
+    } else if (this->ring_buffer_low_free_logged_) {
+      this->ring_buffer_low_free_logged_ = false;
+    }
+    size_t written = temp_ring_buffer->write((void *) data.data(), data.size());
+    if (written != data.size()) {
+      ESP_LOGD(TAG, "Partial write: wrote %zu of %u microphone bytes (buffer nearly full)", written,
+               static_cast<unsigned>(data.size()));
+      // Partial write indicates buffer is nearly full
+      // The low free threshold warning and backpressure system will handle this
+    }
+    const uint32_t now = millis();
+    if (now - this->last_ring_buffer_write_log_ms_ >= 5000) {
+      ESP_LOGV(TAG, "Mic->mww ring write=%u avail=%zu free=%zu use_count=%zu", static_cast<unsigned>(written),
+               temp_ring_buffer->available(), temp_ring_buffer->free(), this->ring_buffer_.use_count());
+      this->last_ring_buffer_write_log_ms_ = now;
     }
   });
 
@@ -154,41 +210,131 @@ void MicroWakeWord::inference_task(void *params) {
 
     if (!(xEventGroupGetBits(this_mww->event_group_) & ERROR_BITS)) {
       // Allocate ring buffer
-      std::shared_ptr<RingBuffer> temp_ring_buffer = RingBuffer::create(
-          this_mww->microphone_source_->get_audio_stream_info().ms_to_bytes(RING_BUFFER_DURATION_MS));
+      const size_t ring_buffer_size_bytes =
+          this_mww->microphone_source_->get_audio_stream_info().ms_to_bytes(this_mww->ring_buffer_duration_ms_);
+      std::shared_ptr<RingBuffer> temp_ring_buffer = RingBuffer::create(ring_buffer_size_bytes);
       if (temp_ring_buffer.use_count() == 0) {
         xEventGroupSetBits(this_mww->event_group_, EventGroupBits::ERROR_MEMORY);
       }
       audio_buffer->set_source(temp_ring_buffer);
       this_mww->ring_buffer_ = temp_ring_buffer;
+      this_mww->ring_buffer_capacity_bytes_ = ring_buffer_size_bytes;
+
+      // Set microphone resume threshold: 50% of buffer size provides hysteresis to prevent rapid pause/resume cycles
+      this_mww->microphone_resume_threshold_bytes_ = std::max(ring_buffer_size_bytes / 2, static_cast<size_t>(1024));
     }
 
     if (!(xEventGroupGetBits(this_mww->event_group_) & ERROR_BITS)) {
       this_mww->microphone_source_->start();
       xEventGroupSetBits(this_mww->event_group_, EventGroupBits::TASK_RUNNING);
+      this_mww->register_inference_watchdog_();
 
-      while (!(xEventGroupGetBits(this_mww->event_group_) & COMMAND_STOP)) {
-        audio_buffer->transfer_data_from_source(pdMS_TO_TICKS(DATA_TIMEOUT_MS));
+      bool should_exit_inference_loop = false;
+      while (!(xEventGroupGetBits(this_mww->event_group_) & COMMAND_STOP) && !should_exit_inference_loop) {
+        this_mww->feed_inference_watchdog_("loop-start");
+        size_t bytes_transferred =
+            audio_buffer->transfer_data_from_source(pdMS_TO_TICKS(DATA_TIMEOUT_MS), /*pre_shift=*/true);
+        while (audio_buffer->free() >= new_bytes_to_process) {
+          size_t additional_transfer = audio_buffer->transfer_data_from_source(0, /*pre_shift=*/false);
+          if (additional_transfer == 0) {
+            break;
+          }
+          bytes_transferred += additional_transfer;
+        }
+        const uint32_t now = millis();
+        const bool should_log_transfer_progress =
+            (now - this_mww->last_progress_log_ms_) >= INFERENCE_PROGRESS_LOG_INTERVAL_MS;
+
+        size_t buffer_available = audio_buffer->available();
+        size_t buffer_capacity = audio_buffer->capacity();
+        size_t buffer_free = audio_buffer->free();
+        size_t ring_available = 0;
+        size_t ring_free = 0;
+        size_t ring_use_count = this_mww->ring_buffer_.use_count();
+        if (auto temp_ring_buffer = this_mww->ring_buffer_.lock()) {
+          ring_available = temp_ring_buffer->available();
+          ring_free = temp_ring_buffer->free();
+        }
+        this_mww->try_resume_microphone_from_backpressure_(ring_free);
+
+        if (should_log_transfer_progress) {
+          this_mww->feed_inference_watchdog_("transfer-log");
+          ESP_LOGV(TAG,
+                   "Inference transfer_data_from_source=%zu buffer=%zu/%zu free=%zu "
+                   "ring avail=%zu free=%zu use_count=%zu",
+                   bytes_transferred, buffer_available, buffer_capacity, buffer_free, ring_available, ring_free,
+                   ring_use_count);
+          this_mww->last_progress_log_ms_ = now;
+        } else {
+          this_mww->feed_inference_watchdog_("transfer-loop");
+        }
+
+        if (bytes_transferred == 0) {
+          this_mww->zero_transfer_counter_++;
+          if (this_mww->zero_transfer_counter_ == 1 || now - this_mww->last_transfer_log_ms_ > 1000) {
+            ESP_LOGD(TAG,
+                     "Inference waiting for data (%u zero reads, buffer=%zu/%zu free=%zu, "
+                     "ring avail=%zu free=%zu use_count=%zu state=%s)",
+                     this_mww->zero_transfer_counter_, buffer_available, buffer_capacity, buffer_free, ring_available,
+                     ring_free, ring_use_count, LOG_STR_ARG(micro_wake_word_state_to_string(this_mww->state_)));
+            this_mww->last_transfer_log_ms_ = now;
+          }
+        } else {
+          this_mww->zero_transfer_counter_ = 0;
+        }
 
         if (audio_buffer->available() < new_bytes_to_process) {
           // Insufficient data to generate new spectrogram features, read more next iteration
+          delay(1);
           continue;
         }
 
-        // Generate new spectrogram features
-        uint32_t processed_samples = this_mww->generate_features_(
-            (int16_t *) audio_buffer->get_buffer_start(), audio_buffer->available() / sizeof(int16_t), features_buffer);
-        audio_buffer->decrease_buffer_length(processed_samples * sizeof(int16_t));
+        do {
+          const uint32_t dsp_log_now = millis();
+          const bool should_log_dsp_progress =
+              (dsp_log_now - this_mww->last_dsp_log_ms_) >= DSP_PROGRESS_LOG_INTERVAL_MS;
+          if (should_log_dsp_progress) {
+            size_t dsp_ring_available = 0;
+            size_t dsp_ring_free = 0;
+            if (auto temp_ring_buffer = this_mww->ring_buffer_.lock()) {
+              dsp_ring_available = temp_ring_buffer->available();
+              dsp_ring_free = temp_ring_buffer->free();
+            }
+            const size_t samples_available = audio_buffer->available() / sizeof(int16_t);
+            this_mww->feed_inference_watchdog_("dsp-log");
+            ESP_LOGV(TAG,
+                     "Inference feeding DSP samples=%zu buffer_bytes=%zu target_bytes=%zu "
+                     "ring avail=%zu free=%zu",
+                     samples_available, audio_buffer->available(), new_bytes_to_process, dsp_ring_available,
+                     dsp_ring_free);
+            this_mww->last_dsp_log_ms_ = dsp_log_now;
+          } else {
+            this_mww->feed_inference_watchdog_("dsp-loop");
+          }
 
-        // Run inference using the new spectorgram features
-        if (!this_mww->update_model_probabilities_(features_buffer)) {
-          xEventGroupSetBits(this_mww->event_group_, EventGroupBits::ERROR_INFERENCE);
-          break;
-        }
+          // Generate new spectrogram features
+          uint32_t processed_samples =
+              this_mww->generate_features_((int16_t *) audio_buffer->get_buffer_start(),
+                                           audio_buffer->available() / sizeof(int16_t), features_buffer);
+          audio_buffer->decrease_buffer_length(processed_samples * sizeof(int16_t));
 
-        // Process each model's probabilities and possibly send a Detection Event to the queue
-        this_mww->process_probabilities_();
+          // Run inference using the new spectorgram features
+          this_mww->feed_inference_watchdog_("before-inference");
+          if (!this_mww->update_model_probabilities_(features_buffer)) {
+            xEventGroupSetBits(this_mww->event_group_, EventGroupBits::ERROR_INFERENCE);
+            should_exit_inference_loop = true;
+            break;
+          }
+          this_mww->feed_inference_watchdog_("after-inference");
+
+          // Process each model's probabilities and possibly send a Detection Event to the queue
+          this_mww->process_probabilities_();
+        } while (audio_buffer->available() >= new_bytes_to_process);
+
+        // Yield to other tasks to prevent task starvation; 1ms is the minimum FreeRTOS tick period
+        delay(1);
       }
+      this_mww->unregister_inference_watchdog_();
     }
   }
 
@@ -234,6 +380,61 @@ void MicroWakeWord::resume_task_() {
   if (this->inference_task_handle_ != nullptr) {
     vTaskResume(this->inference_task_handle_);
   }
+}
+
+void MicroWakeWord::register_inference_watchdog_() {
+  const esp_err_t wdt_add_result = esp_task_wdt_add(nullptr);
+  if (wdt_add_result == ESP_OK) {
+    this->inference_task_wdt_registered_ = true;
+    ESP_LOGD(TAG, "Registered mww task with watchdog");
+  } else {
+    ESP_LOGW(TAG, "Failed to add inference task to watchdog err=%d", wdt_add_result);
+    this->inference_task_wdt_registered_ = false;
+  }
+}
+
+void MicroWakeWord::unregister_inference_watchdog_() {
+  if (!this->inference_task_wdt_registered_) {
+    return;
+  }
+  const esp_err_t wdt_delete_result = esp_task_wdt_delete(nullptr);
+  if (wdt_delete_result != ESP_OK) {
+    ESP_LOGW(TAG, "Failed to remove inference task from watchdog err=%d", wdt_delete_result);
+  } else {
+    ESP_LOGD(TAG, "Unregistered mww task from watchdog");
+  }
+  this->inference_task_wdt_registered_ = false;
+}
+
+void MicroWakeWord::feed_inference_watchdog_(const char *context) {
+  if (!this->inference_task_wdt_registered_) {
+    return;
+  }
+  const esp_err_t watchdog_result = esp_task_wdt_reset();
+  if (watchdog_result != ESP_OK) {
+    ESP_LOGW(TAG, "esp_task_wdt_reset failed err=%d context=%s", watchdog_result, context);
+  }
+}
+
+void MicroWakeWord::pause_microphone_for_backpressure_(const char *reason) {
+  if (this->microphone_flow_controlled_.exchange(true)) {
+    return;
+  }
+  ESP_LOGW(TAG, "Pausing microphone capture: %s", reason);
+  this->microphone_source_->stop();
+}
+
+void MicroWakeWord::try_resume_microphone_from_backpressure_(size_t ring_free_bytes) {
+  if (!this->microphone_flow_controlled_.load()) {
+    return;
+  }
+  if (ring_free_bytes < this->microphone_resume_threshold_bytes_) {
+    return;
+  }
+  ESP_LOGD(TAG, "Resuming microphone capture (ring buffer free=%zu threshold=%zu)", ring_free_bytes,
+           this->microphone_resume_threshold_bytes_);
+  this->microphone_flow_controlled_ = false;
+  this->microphone_source_->start();
 }
 
 void MicroWakeWord::loop() {

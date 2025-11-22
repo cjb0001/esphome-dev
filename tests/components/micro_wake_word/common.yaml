@@ -12,6 +12,7 @@ microphone:
 
 micro_wake_word:
   microphone: echo_microphone
+  ring_buffer_duration: 360ms  # Test new configuration option
   on_wake_word_detected:
     - logger.log: "Wake word detected"
     - micro_wake_word.stop:

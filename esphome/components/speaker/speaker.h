@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <vector>
@@ -63,8 +64,8 @@ class Speaker {
 
   virtual bool has_buffered_data() const = 0;
 
-  bool is_running() const { return this->state_ == STATE_RUNNING; }
-  bool is_stopped() const { return this->state_ == STATE_STOPPED; }
+  bool is_running() const { return this->state_.load(std::memory_order_relaxed) == STATE_RUNNING; }
+  bool is_stopped() const { return this->state_.load(std::memory_order_relaxed) == STATE_STOPPED; }
 
   // Volume control is handled by a configured audio dac component. Individual speaker components can
   // override and implement in software if an audio dac isn't available.
@@ -111,7 +112,7 @@ class Speaker {
   }
 
  protected:
-  State state_{STATE_STOPPED};
+  std::atomic<State> state_{STATE_STOPPED};
   audio::AudioStreamInfo audio_stream_info_;
   float volume_{1.0f};
   bool mute_state_{false};

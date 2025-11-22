@@ -40,6 +40,7 @@ CONF_FEATURE_STEP_SIZE = "feature_step_size"
 CONF_MODELS = "models"
 CONF_ON_WAKE_WORD_DETECTED = "on_wake_word_detected"
 CONF_PROBABILITY_CUTOFF = "probability_cutoff"
+CONF_RING_BUFFER_DURATION = "ring_buffer_duration"
 CONF_SLIDING_WINDOW_AVERAGE_SIZE = "sliding_window_average_size"
 CONF_SLIDING_WINDOW_SIZE = "sliding_window_size"
 CONF_STOP_AFTER_DETECTION = "stop_after_detection"
@@ -357,6 +358,9 @@ CONFIG_SCHEMA = cv.All(
             ),
             cv.Optional(CONF_VAD): _maybe_empty_vad_schema,
             cv.Optional(CONF_STOP_AFTER_DETECTION, default=True): cv.boolean,
+            cv.Optional(
+                CONF_RING_BUFFER_DURATION, default="240ms"
+            ): cv.positive_time_period_milliseconds,
             cv.Optional(CONF_MODEL): cv.invalid(
                 f"The {CONF_MODEL} parameter has moved to be a list element under the {CONF_MODELS} parameter."
             ),
@@ -517,6 +521,7 @@ async def to_code(config):
 
     cg.add(var.set_features_step_size(manifest[KEY_MICRO][CONF_FEATURE_STEP_SIZE]))
     cg.add(var.set_stop_after_detection(config[CONF_STOP_AFTER_DETECTION]))
+    cg.add(var.set_ring_buffer_duration(config[CONF_RING_BUFFER_DURATION]))
 
     if on_wake_word_detection_config := config.get(CONF_ON_WAKE_WORD_DETECTED):
         await automation.build_automation(

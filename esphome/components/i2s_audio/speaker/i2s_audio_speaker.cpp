@@ -16,12 +16,14 @@
 #include "esphome/core/log.h"
 
 #include "esp_timer.h"
+#include <algorithm>
 
 namespace esphome {
 namespace i2s_audio {
 
 static const uint32_t DMA_BUFFER_DURATION_MS = 15;
 static const size_t DMA_BUFFERS_COUNT = 4;
+static const uint32_t MIN_RING_BUFFER_DURATION_MS = DMA_BUFFER_DURATION_MS * DMA_BUFFERS_COUNT * 2;
 
 static const size_t TASK_STACK_SIZE = 4096;
 static const ssize_t TASK_PRIORITY = 19;
@@ -74,8 +76,9 @@ void I2SAudioSpeaker::dump_config() {
   ESP_LOGCONFIG(TAG,
                 "Speaker:\n"
                 "  Pin: %d\n"
-                "  Buffer duration: %" PRIu32,
-                static_cast<int8_t>(this->dout_pin_), this->buffer_duration_ms_);
+                "  Buffer duration: %" PRIu32 " ms (minimum internal: %d ms)",
+                static_cast<int8_t>(this->dout_pin_), this->buffer_duration_ms_,
+                static_cast<int>(MIN_RING_BUFFER_DURATION_MS));
   if (this->timeout_.has_value()) {
     ESP_LOGCONFIG(TAG, "  Timeout: %" PRIu32 " ms", this->timeout_.value());
   }
@@ -92,8 +95,9 @@ void I2SAudioSpeaker::dump_config() {
 void I2SAudioSpeaker::loop() {
   uint32_t event_group_bits = xEventGroupGetBits(this->event_group_);
 
-  if ((event_group_bits & SpeakerEventGroupBits::COMMAND_START) && (this->state_ == speaker::STATE_STOPPED)) {
-    this->state_ = speaker::STATE_STARTING;
+  if ((event_group_bits & SpeakerEventGroupBits::COMMAND_START) &&
+      (this->state_.load(std::memory_order_relaxed) == speaker::STATE_STOPPED)) {
+    this->state_.store(speaker::STATE_STARTING, std::memory_order_relaxed);
     xEventGroupClearBits(this->event_group_, SpeakerEventGroupBits::COMMAND_START);
   }
 
@@ -105,12 +109,12 @@ void I2SAudioSpeaker::loop() {
   if (event_group_bits & SpeakerEventGroupBits::TASK_RUNNING) {
     ESP_LOGD(TAG, "Started");
     xEventGroupClearBits(this->event_group_, SpeakerEventGroupBits::TASK_RUNNING);
-    this->state_ = speaker::STATE_RUNNING;
+    this->state_.store(speaker::STATE_RUNNING, std::memory_order_relaxed);
   }
   if (event_group_bits & SpeakerEventGroupBits::TASK_STOPPING) {
     ESP_LOGD(TAG, "Stopping");
     xEventGroupClearBits(this->event_group_, SpeakerEventGroupBits::TASK_STOPPING);
-    this->state_ = speaker::STATE_STOPPING;
+    this->state_.store(speaker::STATE_STOPPING, std::memory_order_relaxed);
   }
   if (event_group_bits & SpeakerEventGroupBits::TASK_STOPPED) {
     ESP_LOGD(TAG, "Stopped");
@@ -122,7 +126,7 @@ void I2SAudioSpeaker::loop() {
     xEventGroupClearBits(this->event_group_, SpeakerEventGroupBits::ALL_BITS);
     this->status_clear_error();
 
-    this->state_ = speaker::STATE_STOPPED;
+    this->state_.store(speaker::STATE_STOPPED, std::memory_order_relaxed);
   }
 
   // Log any errors encounted by the task
@@ -138,7 +142,7 @@ void I2SAudioSpeaker::loop() {
   }
 
   // Handle the speaker's state
-  switch (this->state_) {
+  switch (this->state_.load(std::memory_order_relaxed)) {
     case speaker::STATE_STARTING:
       if (this->status_has_error()) {
         break;
@@ -212,26 +216,66 @@ size_t I2SAudioSpeaker::play(const uint8_t *data, size_t length, TickType_t tick
     ESP_LOGE(TAG, "Setup failed; cannot play audio");
     return 0;
   }
-  if (this->state_ != speaker::STATE_RUNNING && this->state_ != speaker::STATE_STARTING) {
+  speaker::State current_state = this->state_.load(std::memory_order_relaxed);
+  if (current_state != speaker::STATE_RUNNING && current_state != speaker::STATE_STARTING) {
     this->start();
   }
 
-  if (this->state_ != speaker::STATE_RUNNING) {
+  current_state = this->state_.load(std::memory_order_relaxed);
+  if (current_state != speaker::STATE_RUNNING) {
     // Unable to write data to a running speaker, so delay the max amount of time so it can get ready
     vTaskDelay(ticks_to_wait);
     ticks_to_wait = 0;
   }
 
-  size_t bytes_written = 0;
-  if (this->state_ == speaker::STATE_RUNNING) {
+  size_t total_bytes_written = 0;
+  current_state = this->state_.load(std::memory_order_relaxed);
+  if (current_state == speaker::STATE_RUNNING) {
     std::shared_ptr<RingBuffer> temp_ring_buffer = this->audio_ring_buffer_.lock();
     if (temp_ring_buffer.use_count() == 2) {
-      // Only the speaker task and this temp_ring_buffer own the ring buffer, so its safe to write to
-      bytes_written = temp_ring_buffer->write_without_replacement((void *) data, length, ticks_to_wait);
+      const bool infinite_wait = ticks_to_wait == portMAX_DELAY;
+      const TickType_t deadline = infinite_wait ? 0 : (xTaskGetTickCount() + ticks_to_wait);
+
+      while (total_bytes_written < length && this->state_.load(std::memory_order_relaxed) == speaker::STATE_RUNNING) {
+        size_t free_bytes = temp_ring_buffer->free();
+
+        if (free_bytes == 0) {
+          if (ticks_to_wait == 0) {
+            break;
+          }
+          if (!infinite_wait && xTaskGetTickCount() >= deadline) {
+            break;
+          }
+          // Yield to allow the speaker task to consume buffered audio
+          vTaskDelay(1);
+          continue;
+        }
+
+        const size_t chunk_size = std::min(free_bytes, length - total_bytes_written);
+        size_t chunk_written =
+            temp_ring_buffer->write_without_replacement((void *) (data + total_bytes_written), chunk_size, 0);
+
+        if (chunk_written == 0) {
+          if (ticks_to_wait == 0) {
+            break;
+          }
+          if (!infinite_wait && xTaskGetTickCount() >= deadline) {
+            break;
+          }
+          vTaskDelay(1);
+          continue;
+        }
+
+        total_bytes_written += chunk_written;
+
+        if (chunk_written < chunk_size && ticks_to_wait == 0) {
+          break;
+        }
+      }
     }
   }
 
-  return bytes_written;
+  return total_bytes_written;
 }
 
 bool I2SAudioSpeaker::has_buffered_data() const {
@@ -248,8 +292,9 @@ void I2SAudioSpeaker::speaker_task(void *params) {
   xEventGroupSetBits(this_speaker->event_group_, SpeakerEventGroupBits::TASK_STARTING);
 
   const uint32_t dma_buffers_duration_ms = DMA_BUFFER_DURATION_MS * DMA_BUFFERS_COUNT;
-  // Ensure ring buffer duration is at least the duration of all DMA buffers
-  const uint32_t ring_buffer_duration = std::max(dma_buffers_duration_ms, this_speaker->buffer_duration_ms_);
+  // Ensure ring buffer duration comfortably exceeds DMA buffers and configured duration
+  const uint32_t configured_duration = std::max(dma_buffers_duration_ms, this_speaker->buffer_duration_ms_);
+  const uint32_t ring_buffer_duration = std::max(configured_duration, MIN_RING_BUFFER_DURATION_MS);
 
   // The DMA buffers may have more bits per sample, so calculate buffer sizes based in the input audio stream info
   const size_t ring_buffer_size = this_speaker->current_stream_info_.ms_to_bytes(ring_buffer_duration);

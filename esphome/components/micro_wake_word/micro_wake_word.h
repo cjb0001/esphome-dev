@@ -11,6 +11,7 @@
 #include "esphome/core/component.h"
 #include "esphome/core/ring_buffer.h"
 
+#include <atomic>
 #include <freertos/event_groups.h>
 
 #include <frontend.h>
@@ -45,6 +46,33 @@ class MicroWakeWord : public Component {
   }
 
   void set_stop_after_detection(bool stop_after_detection) { this->stop_after_detection_ = stop_after_detection; }
+
+  /// @brief Sets the ring buffer duration for audio capture
+  /// @param duration_ms Duration in milliseconds
+  ///
+  /// Platform-specific defaults:
+  /// - ESP32 (single-core): 360ms
+  /// - ESP32-S3/C3 (multi-core): 240ms
+  ///
+  /// The ring buffer temporarily stores audio data from the microphone before it's processed.
+  /// Larger values provide more tolerance for CPU scheduling delays and inference spikes,
+  /// but consume more RAM. Smaller values reduce memory usage but may cause audio loss if
+  /// the inference task falls behind.
+  ///
+  /// Recommended values:
+  /// - ESP32 (single core): 360-480ms
+  /// - ESP32-S3/C3 (multi-core): 240-360ms
+  void set_ring_buffer_duration(uint32_t duration_ms) {
+    if (duration_ms < 100) {
+      ESP_LOGW("micro_wake_word", "Ring buffer duration %ums too small, using 100ms", duration_ms);
+      duration_ms = 100;
+    }
+    if (duration_ms > 2000) {
+      ESP_LOGW("micro_wake_word", "Ring buffer duration %ums is unusually large (>2s), verify this is intentional",
+               duration_ms);
+    }
+    this->ring_buffer_duration_ms_ = duration_ms;
+  }
 
   Trigger<std::string> *get_wake_word_detected_trigger() const { return this->wake_word_detected_trigger_; }
 
@@ -81,6 +109,11 @@ class MicroWakeWord : public Component {
   bool stop_after_detection_;
 
   uint8_t features_step_size_;
+#if CONFIG_FREERTOS_UNICORE
+  uint32_t ring_buffer_duration_ms_{360};  // Single-core ESP32 needs more buffering for task scheduling
+#else
+  uint32_t ring_buffer_duration_ms_{240};  // Multi-core ESP32-S3/C3 can use smaller buffer
+#endif
 
   // Audio frontend handles generating spectrogram features
   struct FrontendConfig frontend_config_;
@@ -121,6 +154,23 @@ class MicroWakeWord : public Component {
   /// @param audio_features (int8_t *) Buffer containing new spectrogram features
   /// @return True if successful, false if any errors were encountered
   bool update_model_probabilities_(const int8_t audio_features[PREPROCESSOR_FEATURE_SIZE]);
+
+  uint32_t zero_transfer_counter_{0};
+  uint32_t last_transfer_log_ms_{0};
+  uint32_t last_progress_log_ms_{0};
+  uint32_t last_dsp_log_ms_{0};
+  uint32_t last_ring_buffer_write_log_ms_{0};
+  size_t ring_buffer_capacity_bytes_{0};
+  size_t microphone_resume_threshold_bytes_{0};
+  bool ring_buffer_low_free_logged_{false};
+  bool inference_task_wdt_registered_{false};
+  std::atomic<bool> microphone_flow_controlled_{false};
+
+  void register_inference_watchdog_();
+  void unregister_inference_watchdog_();
+  void feed_inference_watchdog_(const char *context);
+  void pause_microphone_for_backpressure_(const char *reason);
+  void try_resume_microphone_from_backpressure_(size_t ring_free_bytes);
 };
 
 }  // namespace micro_wake_word

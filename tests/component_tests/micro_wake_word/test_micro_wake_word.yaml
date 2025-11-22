@@ -1,0 +1,27 @@
+---
+esphome:
+  name: test
+
+esp32:
+  board: esp32dev
+  framework:
+    type: esp-idf
+
+i2s_audio:
+  i2s_lrclk_pin: GPIO18
+  i2s_bclk_pin: GPIO19
+
+microphone:
+  - platform: i2s_audio
+    id: test_microphone
+    i2s_din_pin: GPIO17
+    adc_type: external
+    pdm: true
+    bits_per_sample: 16bit
+
+# Test custom ring_buffer_duration
+micro_wake_word:
+  microphone: test_microphone
+  ring_buffer_duration: 480ms
+  models:
+    - model: okay_nabu
